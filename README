@@ -1,0 +1,140 @@
+# CAD Schematics Dataset Pipeline
+
+This project builds a dataset from real-world electronic schematics and PCB layouts collected from open hardware repositories and community design-sharing sites. The pipeline is designed to keep growing as new sources are added.
+
+The scripts in this repository are a working base. They are expected to evolve as the pipeline matures.
+
+## Directory Structure
+
+```text
+research-cad/
+├── README.md               # Project documentation
+├── run_pipeline.sh         # Runs ingestion -> cleaning -> optional purge
+├── requirements.txt        # Python dependencies
+├── oshwlab_urls.txt        # Optional: one OSHWLab project URL per line
+├── core/                   # Ingestion, processing, and worker scripts
+│   ├── ingest.py           # Unified ingestion engine
+│   ├── clean_worker.py     # BOM extraction
+│   ├── purge_worker.py     # Temporary storage cleanup
+│   └── vectoriser.py       # Tier 3 + Tier 4 vectorization
+└── storage/                # Multi-tier data lake
+    ├── 1_raw_data/         # Temporary landing zone
+    ├── 2_register_data/    # Central registry (cad_registry.csv)
+    ├── 3_exploitable_data/ # Raw CAD source files ready to parse
+    ├── 4_extracted_data/   # Generated BOM CSV files
+    └── 5_vector_data/      # Embeddings and metadata
+```
+
+## Sources and Feasibility
+
+Not every source is equally automatable, so each one is handled differently.
+
+| Source | Automation level | How it is handled |
+|---|---|---|
+| GitHub / Adafruit (`org:adafruit pcb`) | Fully automatic | `collect_github("adafruit", "pcb")` |
+| GitHub / SparkFun (`org:sparkfun hardware`) | Fully automatic | `collect_github("sparkfun", "hardware", path_filter="hardware")` |
+| Hugging Face `bshada/open-schematics` | Fully automatic | `collect_huggingface_open_schematics()` in streaming mode |
+| OSHWLab (`oshwlab.com`) | Partially automatic | `collect_oshwlab()` reads `oshwlab_urls.txt`; project discovery is still manual |
+| CircuitMaker (`circuitmaker.com/Projects`) | Not implemented | See explanation below |
+
+### Why CircuitMaker is not implemented
+
+CircuitMaker project files cannot be downloaded directly from the browser. The real design files are stored in proprietary Altium formats and require the desktop application and a logged-in account to export them manually. There is no reliable public web endpoint to automate this source, so it is intentionally left out of the pipeline.
+
+### Why OSHWLab is only partially automated
+
+OSHWLab does not expose a public search or listing API, so project discovery still has to be done manually through the site UI. Once you have URLs, `collect_oshwlab()` can process them from `oshwlab_urls.txt`. If a page cannot be parsed automatically, the registry records it as `NeedsManualReview` instead of failing silently.
+
+## Naming and Directory Conventions
+
+- The repository follows the `research-xxx` naming pattern used by the other pipeline.
+- The registry lives at `storage/2_register_data/cad_registry.csv` and is shared by all sources.
+- The storage hierarchy is fixed for consistency, even when some tiers are used less heavily than others.
+
+### Why `1_raw_data` stays mostly empty
+
+Most sources already provide small, directly usable CAD files.
+
+- GitHub ingestion fetches only the matching schematic or PCB files instead of downloading entire repositories. If a repository tree is too large and GitHub truncates the listing, the script falls back to a ZIP download staged in `1_raw_data`, extracts the CAD files, and deletes the archive.
+- Hugging Face rows are streamed directly into `3_exploitable_data`, so there is no large intermediate download.
+
+`1_raw_data` remains in the layout for architectural consistency and for any future source that only offers bulk archives.
+
+## Data Lifecycle
+
+Each row in `cad_registry.csv` tracks one project through the pipeline.
+
+1. **Ingestion**: a source module finds a project and writes its schematic or PCB files to `3_exploitable_data`. The registry status becomes `Pending`, or `Empty` if no matching CAD file was found, or `NeedsManualReview` for an OSHWLab page that could not be parsed automatically.
+2. **Cleaning** (`clean_worker.py`): each `Pending` project is parsed with the matching extractor, and a BOM CSV is written to `4_extracted_data`. The registry status becomes `Done` if at least one BOM was written, or `NoBOM` if no components were found.
+3. **Vectorization** (`vectoriser.py`): Tier 3 structural features and Tier 4 BOM content are combined to produce embeddings in `5_vector_data`.
+4. **Purge** (`purge_worker.py`): only temporary ZIP archives in `1_raw_data` are removed when the fallback path was used. `3_exploitable_data`, `4_extracted_data`, and `5_vector_data` are retained as reusable dataset tiers.
+
+## Fixes Compared to the Previous Version
+
+A few concrete issues were corrected while building this pipeline:
+
+- The Hugging Face dataset is streamed row by row instead of being downloaded in large brittle batches.
+- The KiCad BOM parser distinguishes real placed components from library symbol definitions.
+- BOM filenames keep the full source filename, which avoids collisions between files like `foo.kicad_sch` and `foo.sch`.
+- GitHub ingestion paginates through results and supports authenticated requests through `GITHUB_TOKEN`.
+- `run_pipeline.sh` points to the real script names in `core/`.
+- Comments, log messages, and documentation are kept in English for consistency.
+
+## How to Run
+
+### 1. Setup
+
+```bash
+pip install -r requirements.txt
+```
+
+Before running ingestion, create a GitHub personal access token and export it as `GITHUB_TOKEN`, otherwise GitHub requests will quickly hit the unauthenticated rate limit.
+
+```bash
+export GITHUB_TOKEN=ghp_xxxxxxxxxxxxxxxxxxxx
+```
+
+If you want to use OSHWLab, create `oshwlab_urls.txt` in the project root with one project URL per line.
+
+```text
+https://oshwlab.com/someuser/some-project
+https://oshwlab.com/anotheruser/another-project
+```
+
+### 2. Ingestion
+
+```bash
+python3 core/ingest.py
+```
+
+This runs GitHub ingestion, then Hugging Face streaming ingestion, then OSHWLab if `oshwlab_urls.txt` exists.
+
+### 3. Cleaning and BOM Extraction
+
+```bash
+python3 core/clean_worker.py
+```
+
+This parses every `Pending` project and writes one BOM CSV per source file to `4_extracted_data`.
+
+### 4. Vectorization
+
+```bash
+python3 core/vectoriser.py
+```
+
+This combines Tier 3 structural signals and Tier 4 BOM data, then writes embeddings and metadata to `5_vector_data`.
+
+### 5. Storage Cleanup
+
+```bash
+python3 core/purge_worker.py --dry-run
+python3 core/purge_worker.py
+python3 core/purge_worker.py --yes
+```
+
+### All in One
+
+```bash
+./run_pipeline.sh
+```

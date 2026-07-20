@@ -1,0 +1,15 @@
+# Main Execution Core
+
+This directory contains the operational scripts, automated ingestion pipelines, and background workers for the CAD processing workflow.
+
+This codebase is intentionally a working foundation. The scripts are expected to evolve, be extended, or be replaced as the pipeline requirements change.
+
+## Contents
+
+- **Ingestion tools** (`ingest.py`): a unified script that connects to remote sources to fetch public electronic design projects, including the GitHub API for Adafruit and SparkFun repositories and the streaming mode for the Hugging Face `open-schematics` dataset.
+- **Background workers**: asynchronous processors that handle structural analysis, data cleanup, bill of materials extraction, and vectorization.
+  - `clean_worker.py`: extracts the bill of materials (BOM). This worker specifically parses KiCad schematic files (`.kicad_sch`) and Eagle schematic/board files (`.sch`, `.brd`) from Tier 3, isolates the real placed components, and writes a clean CSV file into Tier 4.
+  - `vectoriser.py`: builds richer semantic summaries by combining the component inventory from the BOM in Tier 4 with structural metrics from the original CAD source files in Tier 3, then generates embedding vectors stored in Tier 5.
+  - `purge_worker.py`: frees disk space by deleting temporary Tier 1 ZIP archives after the target CAD files have been successfully extracted and validated.
+
+**Rule**: All scripts must use relative path resolution based on `__file__` so they remain independent of the deployment environment.
