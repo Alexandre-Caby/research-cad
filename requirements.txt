@@ -3,3 +3,6 @@ pandas
 requests
 datasets
 sentence-transformers
+lancedb
+pillow
+pytest

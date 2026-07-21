@@ -1,25 +1,67 @@
-#!/bin/bash
-set -e
+#!/usr/bin/env bash
+set -euo pipefail
 
-echo "--------------------------------------------------"
-echo "🚀 ELECTRONIC CAD SCHEMATICS PIPELINE"
-echo "--------------------------------------------------"
+source ~/.venv/bin/activate
 
-echo "LOG: Running ingestion (GitHub + Hugging Face + OSHWLab)..."
-python3 core/ingest.py
+LIMIT=""
+PURGE=0
+YES=0
 
-echo "LOG: Running schematic processing (BOM extraction)..."
-python3 core/clean_worker.py
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --limit)
+            LIMIT="$2"
+            shift 2
+            ;;
+        --purge)
+            PURGE=1
+            shift
+            ;;
+        --yes)
+            YES=1
+            shift
+            ;;
+        *)
+            echo "Unknown argument: $1" >&2
+            exit 1
+            ;;
+    esac
+done
 
-echo "LOG: Running vectorisation (embedding generation)..."
-python3 core/vectoriser.py
+# non-interactive by default; only --purge without --yes would block on a
+# confirmation prompt, so purge is always run with --yes here
+run_stage() {
+    echo "--------------------------------------------------"
+    echo "[$(date -u +'%Y-%m-%dT%H:%M:%SZ')] $*"
+    echo "--------------------------------------------------"
+    "$@"
+}
 
-echo "LOG: Running the optional disk purge..."
-read -p "Clear the temporary staging area (1_raw_data)? This cannot be undone. (yes/no): " confirm
-if [[ "$confirm" == "yes" ]]; then
-    python3 core/purge_worker.py --yes
+run_stage python -m core.sources.github --org adafruit --search pcb
+run_stage python -m core.sources.github --org sparkfun --search hardware --path-filter hardware
+
+if [[ -n "$LIMIT" ]]; then
+    run_stage python -m core.sources.huggingface --limit "$LIMIT"
+else
+    run_stage python -m core.sources.huggingface
 fi
 
-echo "--------------------------------------------------"
-echo "🏁 PIPELINE RUN COMPLETE"
-echo "--------------------------------------------------"
+run_stage python -m core.sources.oshwlab
+
+if [[ -n "$LIMIT" ]]; then
+    run_stage python -m core.clean --limit "$LIMIT"
+else
+    run_stage python -m core.clean
+fi
+
+if [[ -n "$LIMIT" ]]; then
+    run_stage python -m core.vectorize --limit "$LIMIT"
+else
+    run_stage python -m core.vectorize
+fi
+
+run_stage python -m core.report
+
+if [[ "$PURGE" -eq 1 ]]; then
+    run_stage python -m core.purge --yes
+fi

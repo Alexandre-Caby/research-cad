@@ -8,21 +8,28 @@ The scripts in this repository are a working base. They are expected to evolve a
 
 ```text
 research-cad/
-├── README.md               # Project documentation
-├── run_pipeline.sh         # Runs ingestion -> cleaning -> optional purge
+├── README                  # Project documentation
+├── run_pipeline.sh         # Orchestrates ingest -> clean -> vectorize -> report
 ├── requirements.txt        # Python dependencies
 ├── oshwlab_urls.txt        # Optional: one OSHWLab project URL per line
-├── core/                   # Ingestion, processing, and worker scripts
-│   ├── ingest.py           # Unified ingestion engine
-│   ├── clean_worker.py     # BOM extraction
-│   ├── purge_worker.py     # Temporary storage cleanup
-│   └── vectoriser.py       # Tier 3 + Tier 4 vectorization
+├── core/                   # Pipeline package (one module per stage)
+│   ├── config.py           # Paths, model names, pinned HF revision
+│   ├── registry.py         # SQLite control plane (status FSM, dedup)
+│   ├── log.py              # Logging setup
+│   ├── sources/            # github.py, huggingface.py, oshwlab.py
+│   ├── parsing/            # kicad.py, eagle.py (schematic/PCB parsers)
+│   ├── clean.py            # BOM extraction
+│   ├── encoders.py         # Text (bge-m3) and image (SigLIP2) encoders
+│   ├── vectorize.py        # Embeddings -> LanceDB
+│   ├── store.py            # LanceDB access + parquet export
+│   ├── report.py           # QC statistics
+│   └── purge.py            # Temporary storage cleanup
 └── storage/                # Multi-tier data lake
     ├── 1_raw_data/         # Temporary landing zone
-    ├── 2_register_data/    # Central registry (cad_registry.csv)
-    ├── 3_exploitable_data/ # Raw CAD source files ready to parse
+    ├── 2_register_data/    # SQLite registry (cad_registry.db)
+    ├── 3_exploitable_data/ # Raw CAD source files + schematic previews
     ├── 4_extracted_data/   # Generated BOM CSV files
-    └── 5_vector_data/      # Embeddings and metadata
+    └── 5_vector_data/      # LanceDB table (vectors + metadata)
 ```
 
 ## Sources and Feasibility
@@ -31,10 +38,10 @@ Not every source is equally automatable, so each one is handled differently.
 
 | Source | Automation level | How it is handled |
 |---|---|---|
-| GitHub / Adafruit (`org:adafruit pcb`) | Fully automatic | `collect_github("adafruit", "pcb")` |
-| GitHub / SparkFun (`org:sparkfun hardware`) | Fully automatic | `collect_github("sparkfun", "hardware", path_filter="hardware")` |
-| Hugging Face `bshada/open-schematics` | Fully automatic | `collect_huggingface_open_schematics()` in streaming mode |
-| OSHWLab (`oshwlab.com`) | Partially automatic | `collect_oshwlab()` reads `oshwlab_urls.txt`; project discovery is still manual |
+| GitHub / Adafruit (`org:adafruit pcb`) | Fully automatic | `core.sources.github` |
+| GitHub / SparkFun (`org:sparkfun hardware`) | Fully automatic | `core.sources.github` with `--path-filter hardware` |
+| Hugging Face `bshada/open-schematics` | Fully automatic | `core.sources.huggingface`, batched by Parquet shard at a pinned revision |
+| OSHWLab (`oshwlab.com`) | Partially automatic | `core.sources.oshwlab` reads `oshwlab_urls.txt`; project discovery is still manual |
 | CircuitMaker (`circuitmaker.com/Projects`) | Not implemented | See explanation below |
 
 ### Why CircuitMaker is not implemented
@@ -43,12 +50,12 @@ CircuitMaker project files cannot be downloaded directly from the browser. The r
 
 ### Why OSHWLab is only partially automated
 
-OSHWLab does not expose a public search or listing API, so project discovery still has to be done manually through the site UI. Once you have URLs, `collect_oshwlab()` can process them from `oshwlab_urls.txt`. If a page cannot be parsed automatically, the registry records it as `NeedsManualReview` instead of failing silently.
+OSHWLab does not expose a public search or listing API, so project discovery still has to be done manually through the site UI. Once you have URLs, `core.sources.oshwlab` can process them from `oshwlab_urls.txt`. OSHWLab pages carry EasyEDA state that no downstream parser handles, so every OSHWLab project is recorded as `manual_review` and skipped by cleaning and vectorization rather than failing silently.
 
 ## Naming and Directory Conventions
 
 - The repository follows the `research-xxx` naming pattern used by the other pipeline.
-- The registry lives at `storage/2_register_data/cad_registry.csv` and is shared by all sources.
+- The registry lives at `storage/2_register_data/cad_registry.db` (SQLite) and is shared by all sources.
 - The storage hierarchy is fixed for consistency, even when some tiers are used less heavily than others.
 
 ### Why `1_raw_data` stays mostly empty
@@ -56,29 +63,25 @@ OSHWLab does not expose a public search or listing API, so project discovery sti
 Most sources already provide small, directly usable CAD files.
 
 - GitHub ingestion fetches only the matching schematic or PCB files instead of downloading entire repositories. If a repository tree is too large and GitHub truncates the listing, the script falls back to a ZIP download staged in `1_raw_data`, extracts the CAD files, and deletes the archive.
-- Hugging Face rows are streamed directly into `3_exploitable_data`, so there is no large intermediate download.
+- Hugging Face shards are downloaded one Parquet batch at a time, written into `3_exploitable_data`, and their cache is cleared between batches, so there is no large persistent download.
 
 `1_raw_data` remains in the layout for architectural consistency and for any future source that only offers bulk archives.
 
 ## Data Lifecycle
 
-Each row in `cad_registry.csv` tracks one project through the pipeline.
+The SQLite registry tracks each project through an explicit status machine. A project is
+deduplicated across sources by the SHA-256 hash of its schematic text.
 
-1. **Ingestion**: a source module finds a project and writes its schematic or PCB files to `3_exploitable_data`. The registry status becomes `Pending`, or `Empty` if no matching CAD file was found, or `NeedsManualReview` for an OSHWLab page that could not be parsed automatically.
-2. **Cleaning** (`clean_worker.py`): each `Pending` project is parsed with the matching extractor, and a BOM CSV is written to `4_extracted_data`. The registry status becomes `Done` if at least one BOM was written, or `NoBOM` if no components were found.
-3. **Vectorization** (`vectoriser.py`): Tier 3 structural features and Tier 4 BOM content are combined to produce embeddings in `5_vector_data`.
-4. **Purge** (`purge_worker.py`): only temporary ZIP archives in `1_raw_data` are removed when the fallback path was used. `3_exploitable_data`, `4_extracted_data`, and `5_vector_data` are retained as reusable dataset tiers.
+```
+ingested -> cleaned -> vectorized -> exported
+    └-> empty | duplicate | manual_review | error   (terminal)
+```
 
-## Fixes Compared to the Previous Version
-
-A few concrete issues were corrected while building this pipeline:
-
-- The Hugging Face dataset is streamed row by row instead of being downloaded in large brittle batches.
-- The KiCad BOM parser distinguishes real placed components from library symbol definitions.
-- BOM filenames keep the full source filename, which avoids collisions between files like `foo.kicad_sch` and `foo.sch`.
-- GitHub ingestion paginates through results and supports authenticated requests through `GITHUB_TOKEN`.
-- `run_pipeline.sh` points to the real script names in `core/`.
-- Comments, log messages, and documentation are kept in English for consistency.
+1. **Ingestion** (`core.sources.*`): a source finds a project, writes its schematic/PCB files and schematic preview to `3_exploitable_data`, and records the project as `ingested` (or `empty` if no CAD file was found, `duplicate` if its content was already ingested, `manual_review` for OSHWLab).
+2. **Cleaning** (`core.clean`): each `ingested` project is parsed with the matching extractor and a BOM CSV is written to `4_extracted_data`. Status becomes `cleaned`, or `empty` if no components were found. Parsing runs across processes.
+3. **Vectorization** (`core.vectorize`): Tier 3 structural features and the Tier 4 BOM are combined into an embedding text, encoded together with the schematic image in batches, and upserted into the LanceDB table in `5_vector_data`. Status becomes `vectorized`. The table is exportable to Parquet / HuggingFace `datasets` for model training.
+4. **Reporting** (`core.report`): prints counts per source, per status, and per file kind.
+5. **Purge** (`core.purge`): removes only the temporary `1_raw_data` staging area. `3_exploitable_data`, `4_extracted_data`, and `5_vector_data` are retained as reusable tiers.
 
 ## How to Run
 
@@ -87,6 +90,9 @@ A few concrete issues were corrected while building this pipeline:
 ```bash
 pip install -r requirements.txt
 ```
+
+Stages run as package modules, so invoke them from the project root with the
+environment that holds the dependencies active.
 
 Before running ingestion, create a GitHub personal access token and export it as `GITHUB_TOKEN`, otherwise GitHub requests will quickly hit the unauthenticated rate limit.
 
@@ -104,37 +110,38 @@ https://oshwlab.com/anotheruser/another-project
 ### 2. Ingestion
 
 ```bash
-python3 core/ingest.py
+python -m core.sources.github --org adafruit --search pcb
+python -m core.sources.github --org sparkfun --search hardware --path-filter hardware
+python -m core.sources.huggingface          # add --limit N for a test run
+python -m core.sources.oshwlab              # reads oshwlab_urls.txt if present
 ```
-
-This runs GitHub ingestion, then Hugging Face streaming ingestion, then OSHWLab if `oshwlab_urls.txt` exists.
 
 ### 3. Cleaning and BOM Extraction
 
 ```bash
-python3 core/clean_worker.py
+python -m core.clean
 ```
 
-This parses every `Pending` project and writes one BOM CSV per source file to `4_extracted_data`.
+This parses every `ingested` project and writes one BOM CSV per source file to `4_extracted_data`.
 
 ### 4. Vectorization
 
 ```bash
-python3 core/vectoriser.py
+python -m core.vectorize
 ```
 
-This combines Tier 3 structural signals and Tier 4 BOM data, then writes embeddings and metadata to `5_vector_data`.
+This combines Tier 3 structural signals and Tier 4 BOM data, encodes text and image in batches, and upserts them into the LanceDB table in `5_vector_data`. Export the table with `python -m core.store --export <path>`.
 
-### 5. Storage Cleanup
+### 5. Reporting and Cleanup
 
 ```bash
-python3 core/purge_worker.py --dry-run
-python3 core/purge_worker.py
-python3 core/purge_worker.py --yes
+python -m core.report
+python -m core.purge --dry-run
+python -m core.purge --yes
 ```
 
 ### All in One
 
 ```bash
-./run_pipeline.sh
+./run_pipeline.sh                # optional: --limit N, --purge, --yes
 ```
