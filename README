@@ -16,7 +16,7 @@ research-cad/
 │   ├── config.py           # Paths, model names, pinned HF revision
 │   ├── registry.py         # SQLite control plane (status FSM, dedup)
 │   ├── log.py              # Logging setup
-│   ├── sources/            # github.py, huggingface.py, oshwlab.py
+│   ├── sources/            # github.py, huggingface.py, mouser.py, oshwlab.py
 │   ├── parsing/            # kicad.py, eagle.py (schematic/PCB parsers)
 │   ├── clean.py            # BOM extraction
 │   ├── encoders.py         # Text (bge-m3) and image (SigLIP2) encoders
@@ -41,6 +41,7 @@ Not every source is equally automatable, so each one is handled differently.
 | GitHub / Adafruit (`org:adafruit pcb`) | Fully automatic | `core.sources.github` |
 | GitHub / SparkFun (`org:sparkfun hardware`) | Fully automatic | `core.sources.github` with `--path-filter hardware` |
 | Hugging Face `bshada/open-schematics` | Fully automatic | `core.sources.huggingface`, batched by Parquet shard at a pinned revision |
+| Mouser API (V1/V2) | Fully automatic | `core.sources.mouser`, hybrid part/keyword search, technical specs caching, and datasheet PDF fetch |
 | OSHWLab (`oshwlab.com`) | Partially automatic | `core.sources.oshwlab` reads `oshwlab_urls.txt`; project discovery is still manual |
 | CircuitMaker (`circuitmaker.com/Projects`) | Not implemented | See explanation below |
 
@@ -73,15 +74,16 @@ The SQLite registry tracks each project through an explicit status machine. A pr
 deduplicated across sources by the SHA-256 hash of its schematic text.
 
 ```
-ingested -> cleaned -> vectorized -> exported
+ingested -> cleaned -> mouser_enriched -> vectorized -> exported
     └-> empty | duplicate | manual_review | error   (terminal)
 ```
 
-1. **Ingestion** (`core.sources.*`): a source finds a project, writes its schematic/PCB files and schematic preview to `3_exploitable_data`, and records the project as `ingested` (or `empty` if no CAD file was found, `duplicate` if its content was already ingested, `manual_review` for OSHWLab).
-2. **Cleaning** (`core.clean`): each `ingested` project is parsed with the matching extractor and a BOM CSV is written to `4_extracted_data`. Status becomes `cleaned`, or `empty` if no components were found. Parsing runs across processes.
-3. **Vectorization** (`core.vectorize`): Tier 3 structural features and the Tier 4 BOM are combined into an embedding text, encoded together with the schematic image in batches, and upserted into the LanceDB table in `5_vector_data`. Status becomes `vectorized`. The table is exportable to Parquet / HuggingFace `datasets` for model training.
-4. **Reporting** (`core.report`): prints counts per source, per status, and per file kind.
-5. **Purge** (`core.purge`): removes only the temporary `1_raw_data` staging area. `3_exploitable_data`, `4_extracted_data`, and `5_vector_data` are retained as reusable tiers.
+1. **Ingestion** (`core.sources.*`): a source finds a project, skips projects that are already registered in the database, writes its schematic/PCB files and schematic preview to `3_exploitable_data`, and records the project as `ingested` (or `empty` if no CAD file was found, `duplicate` if its content was already ingested, `manual_review` for OSHWLab).
+2. **Cleaning** (`core.clean`): each `ingested` project is parsed with the matching extractor and a BOM CSV is written to `4_extracted_data`. SQLite checkpoints are committed in real time, project by project, via `as_completed()`. Status becomes `cleaned`, or `empty` if no components were found.
+3. **Mouser enrichment** (`core.sources.mouser`): the cleaned BOMs in Tier 4 are queried against Mouser API V1/V2, the SQLite `components` table is enriched with cached manufacturer and category attributes, and datasheet PDFs are downloaded into Tier 3.
+4. **Vectorization** (`core.vectorize`): Tier 3 structural features, Mouser technical specifications, and the Tier 4 BOM are combined into an embedding text, then text and schematic image are encoded in mini-batches and upserted into the LanceDB table in `5_vector_data`. Status becomes `vectorized`. The table is exportable to Parquet / HuggingFace `datasets` for model training.
+5. **Reporting** (`core.report`): prints counts per source, per status, and per file kind.
+6. **Purge** (`core.purge`): removes only the temporary `1_raw_data` staging area. `3_exploitable_data`, `4_extracted_data`, and `5_vector_data` are retained as reusable tiers.
 
 ## How to Run
 
@@ -98,6 +100,12 @@ Before running ingestion, create a GitHub personal access token and export it as
 
 ```bash
 export GITHUB_TOKEN=ghp_xxxxxxxxxxxxxxxxxxxx
+```
+
+If you want Mouser enrichment, create a Mouser API key and export it as `MOUSER_API_KEY`.
+
+```bash
+export MOUSER_API_KEY=your_mouser_api_key
 ```
 
 If you want to use OSHWLab, create `oshwlab_urls.txt` in the project root with one project URL per line.
@@ -122,17 +130,25 @@ python -m core.sources.oshwlab              # reads oshwlab_urls.txt if present
 python -m core.clean
 ```
 
-This parses every `ingested` project and writes one BOM CSV per source file to `4_extracted_data`.
+This parses every `ingested` project and writes one BOM CSV per source file to `4_extracted_data`. Run Mouser enrichment after cleaning so the BOM cache is available before vectorization.
 
-### 4. Vectorization
+### 4. Mouser Enrichment
+
+```bash
+python -m core.sources.mouser   # component enrichment and datasheet downloads
+```
+
+This enriches the cleaned BOMs from Tier 4, updates the cached component table, and downloads datasheet PDFs into Tier 3.
+
+### 5. Vectorization
 
 ```bash
 python -m core.vectorize
 ```
 
-This combines Tier 3 structural signals and Tier 4 BOM data, encodes text and image in batches, and upserts them into the LanceDB table in `5_vector_data`. Export the table with `python -m core.store --export <path>`.
+This combines Tier 3 structural signals, Mouser technical data, and Tier 4 BOM data, encodes text and image in mini-batches, and upserts them into the LanceDB table in `5_vector_data`. Export the table with `python -m core.store --export <path>`.
 
-### 5. Reporting and Cleanup
+### 6. Reporting and Cleanup
 
 ```bash
 python -m core.report

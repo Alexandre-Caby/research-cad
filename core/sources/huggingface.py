@@ -1,9 +1,10 @@
-"""Hugging Face open-schematics source: batches parquet shards into the registry."""
+"""Hugging Face open-schematics source: row-by-row ingestion with SQLite dedup and strict cache purging."""
 
 import argparse
+import gc
 import os
 import re
-
+import shutil
 from core import config
 from core import registry as R
 from core.log import get_logger
@@ -11,112 +12,44 @@ from core.log import get_logger
 logger = get_logger(__name__)
 
 HF_COL_SCHEMATIC = "schematic"
-HF_COL_IMAGE = "schematic_image" 
-HF_COL_EXTENSIONS = "extensions_used" 
+HF_COL_IMAGE = "schematic_image"
+HF_COL_EXTENSIONS = "extensions_used"
 HF_KEEP_COLUMNS = [
     HF_COL_SCHEMATIC, HF_COL_IMAGE, HF_COL_EXTENSIONS,
     "components_used", "schematic_json", "schematic_yaml", "name",
 ]
-
 _SCHEMATIC_EXTS = (".kicad_sch", ".sch", ".schdoc")
 
 
 def _hf_safe_name(raw_name):
-    """Filesystem-safe project name, stable between the dedup check and the writer."""
     return re.sub(r"[^A-Za-z0-9._-]+", "_", raw_name).strip("_") or "unnamed"
 
 
 def _pick_schematic_ext(extensions_used):
-    """Schematic text is a KiCad S-expression, so default to .kicad_sch."""
     for ext in (extensions_used or []):
         if isinstance(ext, str) and ext.lower() in _SCHEMATIC_EXTS:
             return ext.lower()
     return ".kicad_sch"
 
 
-def _process_row_worker(args):
-    i, row, save_images, usable_dir = args
-
-    raw_name = row.get("name") or f"row_{i}"
-    safe_name = _hf_safe_name(raw_name)
-
-    schematic = row.get(HF_COL_SCHEMATIC)
-    if not (schematic and str(schematic).strip()):
-        return None
-
-    content_hash = R.content_hash(schematic)
-
-    project_id = f"hf_{safe_name}_{content_hash[:8]}"
-
-    return {
-        "project_id": project_id,
-        "raw_name": raw_name,
-        "safe_name": safe_name,
-        "schematic": schematic,
-        "content_hash": content_hash,
-        "extension": _pick_schematic_ext(row.get(HF_COL_EXTENSIONS)),
-        "image": row.get(HF_COL_IMAGE) if save_images else None,
-    }
-
-
-def _write_files(item, usable_dir):
-
-    files = []
-    sch_filename = f"{item['project_id']}_schema{item['extension']}"
-    with open(os.path.join(usable_dir, sch_filename), "w", encoding="utf-8") as f:
-        f.write(item["schematic"])
-    files.append((sch_filename, "schematic", item["extension"]))
-
-    img = item["image"]
-    if isinstance(img, dict):
-        img_bytes = img.get("bytes")
-        img_ext = ".png"
-        path = img.get("path")
-        if path and os.path.splitext(path)[1]:
-            img_ext = os.path.splitext(path)[1].lower()
-        if img_bytes:
-            image_filename = f"{item['project_id']}_schema{img_ext}"
-            with open(os.path.join(usable_dir, image_filename), "wb") as f:
-                f.write(img_bytes)
-            files.append((image_filename, "image", img_ext))
-
-    return files
-
-
-def _ingest_item(conn, item, usable_dir, url) -> bool:
-    """Register one row; returns True if it was ingested (new or re-run of
-    itself), False if it's a genuine duplicate of a DIFFERENT project."""
-    existing = R.hash_seen(conn, item["content_hash"])
-
-    if existing is not None and existing != item["project_id"]:
-        R.upsert_project(
-            conn, item["project_id"], item["raw_name"],
-            "HuggingFace_OpenSchematics", url,
-            content_hash=item["content_hash"], status=R.DUPLICATE,
-        )
-        return False
-
-    files = _write_files(item, usable_dir)
-    R.upsert_project(
-        conn, item["project_id"], item["raw_name"],
-        "HuggingFace_OpenSchematics", url,
-        content_hash=item["content_hash"], status=R.INGESTED,
-    )
-    R.add_files(conn, item["project_id"], files)
-    return True
+def _purge_directory(path):
+    """Supprime un dossier et son contenu pour libérer immédiatement le disque."""
+    if os.path.exists(path):
+        try:
+            shutil.rmtree(path)
+        except Exception as exc:
+            logger.warning("Erreur lors de la purge de %s: %s", path, exc)
 
 
 def collect(conn, batch_size=30, limit=None, save_images=True) -> None:
-    """Ingest bshada/open-schematics parquet shards into the SQLite registry."""
     from datasets import load_dataset, Image as HFImage
     from huggingface_hub import HfApi
 
-    logger.info("Listing Parquet files for %s...", config.HF_DATASET_ID)
+    logger.info("Listing des parquets sur Hugging Face (%s)...", config.HF_DATASET_ID)
     api = HfApi()
     all_files = api.list_repo_files(repo_id=config.HF_DATASET_ID, repo_type="dataset")
     parquet_files = sorted(f for f in all_files if f.startswith("data/") and f.endswith(".parquet"))
 
-    cache_dir = os.path.join(config.RAW_DIR, "hf_cache")
     url = f"https://huggingface.co/datasets/{config.HF_DATASET_ID}"
     new_count = 0
 
@@ -124,42 +57,83 @@ def collect(conn, batch_size=30, limit=None, save_images=True) -> None:
         if limit is not None and new_count >= limit:
             break
 
-        batch_files = parquet_files[idx: idx + batch_size]
-        logger.info("Loading batch of %d parquet file(s)...", len(batch_files))
+        batch_files = parquet_files[idx : idx + batch_size]
 
-        dataset = load_dataset(
-            config.HF_DATASET_ID,
-            data_files=batch_files,
-            split="train",
-            revision=config.HF_REVISION,
-            cache_dir=cache_dir,
-        )
+        batch_cache_dir = os.path.join(config.RAW_DIR, f"hf_cache_batch_{idx}")
 
-        keep = [c for c in HF_KEEP_COLUMNS if c in dataset.column_names]
-        dataset = dataset.select_columns(keep)
+        logger.info("Chargement du batch Parquet %d/%d...", (idx // batch_size) + 1, (len(parquet_files) + batch_size - 1) // batch_size)
 
-        if HF_COL_IMAGE in dataset.column_names:
-            dataset = dataset.cast_column(HF_COL_IMAGE, HFImage(decode=False))
+        try:
+            dataset = load_dataset(
+                config.HF_DATASET_ID,
+                data_files=batch_files,
+                split="train",
+                revision=config.HF_REVISION,
+                cache_dir=batch_cache_dir,
+            )
 
-        dataset = dataset.filter(
-            lambda schematic: bool(schematic and str(schematic).strip()),
-            input_columns=[HF_COL_SCHEMATIC],
-        )
+            keep = [c for c in HF_KEEP_COLUMNS if c in dataset.column_names]
+            dataset = dataset.select_columns(keep)
 
-        for i, row in enumerate(dataset):
-            if limit is not None and new_count >= limit:
-                break
+            if HF_COL_IMAGE in dataset.column_names:
+                dataset = dataset.cast_column(HF_COL_IMAGE, HFImage(decode=False))
 
-            item = _process_row_worker((i, row, save_images, config.USABLE_DIR))
-            if item is None:
-                continue
+            dataset = dataset.filter(
+                lambda schematic: bool(schematic and str(schematic).strip()),
+                input_columns=[HF_COL_SCHEMATIC],
+            )
 
-            if _ingest_item(conn, item, config.USABLE_DIR, url):
+            for i, row in enumerate(dataset):
+                if limit is not None and new_count >= limit:
+                    break
+
+                schematic = row.get(HF_COL_SCHEMATIC)
+                if not schematic:
+                    continue
+
+                raw_name = row.get("name") or f"row_{i}"
+                safe_name = _hf_safe_name(raw_name)
+
+                c_hash = R.content_hash(schematic)
+                project_id = f"hf_{safe_name}_{c_hash[:8]}"
+
+                existing_status = R.get_by_status(conn, project_id)
+                if existing_status in (R.INGESTED, R.CLEANED, R.VECTORIZED, R.EMPTY, R.DUPLICATE):
+                    continue
+
+                existing = R.hash_seen(conn, c_hash)
+                if existing is not None and existing != project_id:
+                    R.upsert_project(conn, project_id, raw_name, "HuggingFace_OpenSchematics", url, content_hash=c_hash, status=R.DUPLICATE)
+                    continue
+
+                ext = _pick_schematic_ext(row.get(HF_COL_EXTENSIONS))
+                sch_filename = f"{project_id}_schema{ext}"
+                sch_path = os.path.join(config.USABLE_DIR, sch_filename)
+
+                with open(sch_path, "w", encoding="utf-8") as f:
+                    f.write(schematic)
+
+                files_registered = [(sch_filename, "schematic", ext)]
+
+                if save_images and row.get(HF_COL_IMAGE):
+                    img = row[HF_COL_IMAGE]
+                    if isinstance(img, dict) and img.get("bytes"):
+                        img_filename = f"{project_id}_schema.png"
+                        with open(os.path.join(config.USABLE_DIR, img_filename), "wb") as f:
+                            f.write(img["bytes"])
+                        files_registered.append((img_filename, "image", ".png"))
+
+                R.upsert_project(conn, project_id, raw_name, "HuggingFace_OpenSchematics", url, content_hash=c_hash, status=R.INGESTED)
+                R.add_files(conn, project_id, files_registered)
                 new_count += 1
 
-        dataset = None
+        finally:
+            del dataset
+            gc.collect()
+            _purge_directory(batch_cache_dir)
+            logger.info("Cache disque du batch purgé.")
 
-    logger.info("Hugging Face collection finished: %d new project(s).", new_count)
+    logger.info("Collecte Hugging Face terminée. %d projet(s) ingéré(s).", new_count)
 
 
 if __name__ == "__main__":

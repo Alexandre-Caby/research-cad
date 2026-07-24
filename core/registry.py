@@ -46,11 +46,26 @@ def init_db(db_path) -> None:
                 )"""
             )
             conn.execute(
+                """CREATE TABLE IF NOT EXISTS components (
+                    mpn TEXT PRIMARY KEY,
+                    mouser_part_number TEXT,
+                    manufacturer TEXT,
+                    description TEXT,
+                    category TEXT,
+                    lifecycle_status TEXT,
+                    datasheet_url TEXT,
+                    datasheet_path TEXT,
+                    attributes_json TEXT,
+                    updated_at TEXT
+                )"""
+            )
+            conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_projects_content_hash ON projects(content_hash)"
             )
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_projects_status ON projects(status)"
             )
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_components_mpn ON components(mpn)")
     finally:
         conn.close()
 
@@ -107,3 +122,34 @@ def hash_seen(conn, content_hash) -> str | None:
         "SELECT project_id FROM projects WHERE content_hash = ?", (content_hash,)
     ).fetchone()
     return row["project_id"] if row else None
+
+def get_cached_components(conn, mpns: list[str]) -> dict:
+    if not mpns:
+        return {}
+    placeholders = ",".join(["?"] * len(mpns))
+    rows = conn.execute(
+        f"SELECT * FROM components WHERE mpn IN ({placeholders})", list(mpns)
+    ).fetchall()
+    return {row["mpn"]: dict(row) for row in rows}
+
+
+def upsert_component(conn, mpn, mouser_pn, mfr, desc, category, status, ds_url, ds_path, attrs_json) -> None:
+    now = datetime.now(timezone.utc).isoformat()
+    with conn:
+        conn.execute(
+            """INSERT INTO components
+            (mpn, mouser_part_number, manufacturer, description, category,
+             lifecycle_status, datasheet_url, datasheet_path, attributes_json, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(mpn) DO UPDATE SET
+                mouser_part_number=excluded.mouser_part_number,
+                manufacturer=excluded.manufacturer,
+                description=excluded.description,
+                category=excluded.category,
+                lifecycle_status=excluded.lifecycle_status,
+                datasheet_url=excluded.datasheet_url,
+                datasheet_path=COALESCE(excluded.datasheet_path, components.datasheet_path),
+                attributes_json=excluded.attributes_json,
+                updated_at=excluded.updated_at""",
+            (mpn, mouser_pn, mfr, desc, category, status, ds_url, ds_path, attrs_json, now),
+        )

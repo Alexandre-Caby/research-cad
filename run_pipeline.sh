@@ -28,8 +28,6 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# non-interactive by default; only --purge without --yes would block on a
-# confirmation prompt, so purge is always run with --yes here
 run_stage() {
     echo "--------------------------------------------------"
     echo "[$(date -u +'%Y-%m-%dT%H:%M:%SZ')] $*"
@@ -52,6 +50,12 @@ if [[ -n "$LIMIT" ]]; then
     run_stage python -m core.clean --limit "$LIMIT"
 else
     run_stage python -m core.clean
+fi
+
+if [[ -n "$LIMIT" ]]; then
+    run_stage python -m core.sources.mouser --limit "$LIMIT"
+else
+    run_stage python -m core.sources.mouser
 fi
 
 if [[ -n "$LIMIT" ]]; then

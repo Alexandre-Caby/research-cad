@@ -1,4 +1,4 @@
-"""GitHub source: scans an org's repositories for CAD files."""
+"""GitHub source: scans an org's repositories for CAD files with instant skip for known projects."""
 
 import argparse
 import hashlib
@@ -6,9 +6,7 @@ import os
 import time
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
-
 import requests
-
 from core import config
 from core import registry as R
 from core.log import get_logger
@@ -17,10 +15,7 @@ logger = get_logger(__name__)
 
 GITHUB_API = "https://api.github.com"
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
-
 _PCB_EXTENSIONS = {".kicad_pcb", ".brd", ".pcbdoc"}
-# Altium's binary formats can't be decoded to text, so they're exempt from
-# content-hash dedup.
 _BINARY_EXTENSIONS = {".schdoc", ".pcbdoc"}
 
 os.makedirs(config.USABLE_DIR, exist_ok=True)
@@ -35,10 +30,14 @@ def _github_headers():
 
 
 def _github_get(url, params=None, max_retries=5):
-    """GET wrapper that waits out GitHub's rate limit instead of failing."""
     response = None
-    for _ in range(max_retries):
-        response = requests.get(url, headers=_github_headers(), params=params, timeout=30)
+    for attempt in range(1, max_retries + 1):
+        try:
+            response = requests.get(url, headers=_github_headers(), params=params, timeout=30)
+        except requests.RequestException as e:
+            logger.warning("Network/Proxy error on GitHub request (%d/%d): %s. Retrying in 5s...", attempt, max_retries, e)
+            time.sleep(5)
+            continue
         if response.status_code == 200:
             return response
         if response.status_code in (403, 429) and response.headers.get("X-RateLimit-Remaining") == "0":
@@ -48,7 +47,7 @@ def _github_get(url, params=None, max_retries=5):
             time.sleep(min(wait_s, 900))
             continue
         return response
-    return response
+    return None
 
 
 def _list_repo_tree(owner, repo, branch):
@@ -72,9 +71,6 @@ def _fetch_raw_file(owner, repo, branch, path):
 
 
 def _dest_name(org, name, path):
-    """Filesystem-safe, collision-free destination filename. Files with the
-    same basename in different repo subdirs must not overwrite each other,
-    so the (short-hashed) directory is folded into the name."""
     basename = os.path.basename(path)
     dirname = os.path.dirname(path)
     if not dirname:
@@ -88,9 +84,6 @@ def _file_kind(ext):
 
 
 def _is_duplicate(conn, content, ext):
-    """Cross-source dedup: skip a file whose text content hash matches a
-    project already registered (e.g. the same schematic ingested from
-    HuggingFace)."""
     if ext in _BINARY_EXTENSIONS:
         return False
     text = content.decode("utf-8", errors="ignore")
@@ -98,9 +91,6 @@ def _is_duplicate(conn, content, ext):
 
 
 def _primary_content_hash(entries: list[tuple[bytes, str, str]]) -> str | None:
-    """The projects table has one content_hash column but a repo can hold
-    several schematics, so only the first text-based schematic represents
-    the project for cross-source dedup; binary Altium files are unhashable."""
     for content, kind, ext in entries:
         if kind == "schematic" and ext not in _BINARY_EXTENSIONS:
             return R.content_hash(content.decode("utf-8", errors="ignore"))
@@ -108,7 +98,6 @@ def _primary_content_hash(entries: list[tuple[bytes, str, str]]) -> str | None:
 
 
 def _download_repo_zip_fallback(conn, org, name, branch):
-    """Fallback for truncated repo trees. Returns (extracted, content_hash)."""
     url = f"{GITHUB_API}/repos/{org}/{name}/zipball/{branch}"
     try:
         with requests.get(url, headers=_github_headers(), stream=True, timeout=180) as response:
@@ -132,8 +121,6 @@ def _download_repo_zip_fallback(conn, org, name, branch):
                 content = archive.read(info.filename)
                 if _is_duplicate(conn, content, ext):
                     continue
-                # The zipball root entry is "<owner>-<repo>-<sha>/...", so
-                # strip it before computing the collision-free dest name.
                 relative_path = info.filename.split("/", 1)[-1]
                 dest_name = _dest_name(org, name, relative_path)
                 dest_path = os.path.join(config.USABLE_DIR, dest_name)
@@ -145,20 +132,24 @@ def _download_repo_zip_fallback(conn, org, name, branch):
     except zipfile.BadZipFile:
         logger.warning("Corrupted archive for %s/%s, skipped.", org, name)
     finally:
-        os.remove(zip_path)
-
+        if os.path.exists(zip_path):
+            os.remove(zip_path)
     return extracted, _primary_content_hash(raw_entries)
 
 
 def collect(conn, org, search_term, path_filter=None):
-    """Scan an org's repositories for CAD files and register them."""
     if not GITHUB_TOKEN:
         logger.warning("No GITHUB_TOKEN set; GitHub's unauthenticated rate limit is low.")
 
-    logger.info("Scanning org '%s' for '%s'...", org, search_term)
+    known_projects = {
+        row["project_id"] for row in conn.execute("SELECT project_id FROM projects").fetchall()
+    }
+
+    logger.info("Scanning org '%s' for '%s' (%d projects already in DB)...", org, search_term, len(known_projects))
     page = 1
     per_page = 100
     total_seen = 0
+    skipped_count = 0
 
     while True:
         response = _github_get(
@@ -168,18 +159,21 @@ def collect(conn, org, search_term, path_filter=None):
         if response is None or response.status_code != 200:
             logger.warning("GitHub search API call failed for %s (page %d).", org, page)
             break
-
         repos = response.json().get("items", [])
         if not repos:
             break
 
         for repo in repos:
             total_seen += 1
-            repo_url = repo["html_url"]
             project_id = f"gh_{repo['id']}"
             name = repo["name"]
-            branch = repo["default_branch"]
 
+            if project_id in known_projects:
+                skipped_count += 1
+                continue
+
+            repo_url = repo["html_url"]
+            branch = repo["default_branch"]
             tree, truncated = _list_repo_tree(org, name, branch)
             if tree is None:
                 continue
@@ -193,12 +187,10 @@ def collect(conn, org, search_term, path_filter=None):
                     and os.path.splitext(item["path"])[1].lower() in config.CAD_EXTENSIONS
                     and (path_filter is None or path_filter.lower() in item["path"].lower())
                 ]
-
                 with ThreadPoolExecutor(max_workers=8) as executor:
                     fetched = list(executor.map(
                         lambda path: (path, _fetch_raw_file(org, name, branch, path)), matches
                     ))
-
                 extracted = []
                 raw_entries = []
                 for path, content in fetched:
@@ -222,13 +214,15 @@ def collect(conn, org, search_term, path_filter=None):
             )
             if extracted:
                 R.add_files(conn, project_id, extracted)
+
+            known_projects.add(project_id)
             logger.info("%s %s: %d CAD file(s)", "OK" if extracted else "-", name, len(extracted))
 
         if len(repos) < per_page or page * per_page >= 1000:
             break
         page += 1
 
-    logger.info("GitHub_%s: %d repositories scanned.", org, total_seen)
+    logger.info("GitHub_%s: %d repositories scanned, %d skipped (already in DB).", org, total_seen, skipped_count)
 
 
 if __name__ == "__main__":
