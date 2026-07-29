@@ -1,5 +1,6 @@
 """SQLite control plane: project lifecycle state shared by every source/worker."""
 import hashlib
+import os
 import sqlite3
 from datetime import datetime, timezone
 
@@ -14,6 +15,8 @@ ERROR = "error"
 
 
 def connect(db_path) -> sqlite3.Connection:
+    db_path = os.path.abspath(db_path)
+    os.makedirs(os.path.dirname(db_path), exist_ok=True)
     conn = sqlite3.connect(str(db_path))
     conn.execute("PRAGMA journal_mode=WAL")
     conn.row_factory = sqlite3.Row
@@ -93,9 +96,21 @@ def upsert_project(conn, project_id, name, source, url, content_hash=None, statu
 
 
 def add_files(conn, project_id, files: list[tuple[str, str, str]]) -> None:
-    # Clear-then-add keeps a re-run's file rows from accumulating duplicates.
     with conn:
         conn.execute("DELETE FROM files WHERE project_id = ?", (project_id,))
+        conn.executemany(
+            "INSERT INTO files (project_id, filename, kind, ext) VALUES (?, ?, ?, ?)",
+            [(project_id, filename, kind, ext) for filename, kind, ext in files],
+        )
+
+
+def append_files(conn, project_id, files: list[tuple[str, str, str]]) -> None:
+    """Adds derived-artifact file rows without touching a project's existing
+    rows. Safe to call multiple times per project (e.g. once per CAD file
+    that produces a BOM), unlike add_files's clear-then-add semantics."""
+    if not files:
+        return
+    with conn:
         conn.executemany(
             "INSERT INTO files (project_id, filename, kind, ext) VALUES (?, ?, ?, ?)",
             [(project_id, filename, kind, ext) for filename, kind, ext in files],
@@ -122,6 +137,16 @@ def hash_seen(conn, content_hash) -> str | None:
         "SELECT project_id FROM projects WHERE content_hash = ?", (content_hash,)
     ).fetchone()
     return row["project_id"] if row else None
+
+
+def get_known_identifiers(conn) -> tuple[dict[str, str], dict[str, str]]:
+    """Preloads {project_id: status} and {content_hash: project_id} once so
+    callers processing many rows (e.g. huggingface.py over ~317GB) can do
+    in-memory skip checks instead of one SQL round trip per row."""
+    rows = conn.execute("SELECT project_id, status, content_hash FROM projects").fetchall()
+    known_statuses = {row["project_id"]: row["status"] for row in rows}
+    known_hashes = {row["content_hash"]: row["project_id"] for row in rows if row["content_hash"]}
+    return known_statuses, known_hashes
 
 def get_cached_components(conn, mpns: list[str]) -> dict:
     if not mpns:

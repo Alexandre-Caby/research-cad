@@ -85,7 +85,7 @@ def run_clean(limit=None, workers=None):
             
             if components:
                 bom_name = _write_bom(filename, components)
-                R.add_files(conn, pid, [(bom_name, "bom", ".csv")])
+                R.append_files(conn, pid, [(bom_name, "bom", ".csv")])
                 project_results[pid].append(True)
             else:
                 project_results[pid].append(False)

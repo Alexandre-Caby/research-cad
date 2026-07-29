@@ -53,6 +53,9 @@ def collect(conn, batch_size=30, limit=None, save_images=True) -> None:
     url = f"https://huggingface.co/datasets/{config.HF_DATASET_ID}"
     new_count = 0
 
+    known_statuses, known_hashes = R.get_known_identifiers(conn)
+    _resumable_statuses = (R.INGESTED, R.CLEANED, R.VECTORIZED, R.EMPTY, R.DUPLICATE)
+
     for idx in range(0, len(parquet_files), batch_size):
         if limit is not None and new_count >= limit:
             break
@@ -97,13 +100,13 @@ def collect(conn, batch_size=30, limit=None, save_images=True) -> None:
                 c_hash = R.content_hash(schematic)
                 project_id = f"hf_{safe_name}_{c_hash[:8]}"
 
-                existing_status = R.get_by_status(conn, project_id)
-                if existing_status in (R.INGESTED, R.CLEANED, R.VECTORIZED, R.EMPTY, R.DUPLICATE):
+                if known_statuses.get(project_id) in _resumable_statuses:
                     continue
 
-                existing = R.hash_seen(conn, c_hash)
+                existing = known_hashes.get(c_hash)
                 if existing is not None and existing != project_id:
                     R.upsert_project(conn, project_id, raw_name, "HuggingFace_OpenSchematics", url, content_hash=c_hash, status=R.DUPLICATE)
+                    known_statuses[project_id] = R.DUPLICATE
                     continue
 
                 ext = _pick_schematic_ext(row.get(HF_COL_EXTENSIONS))
@@ -125,6 +128,8 @@ def collect(conn, batch_size=30, limit=None, save_images=True) -> None:
 
                 R.upsert_project(conn, project_id, raw_name, "HuggingFace_OpenSchematics", url, content_hash=c_hash, status=R.INGESTED)
                 R.add_files(conn, project_id, files_registered)
+                known_statuses[project_id] = R.INGESTED
+                known_hashes[c_hash] = project_id
                 new_count += 1
 
         finally:

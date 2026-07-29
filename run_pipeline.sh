@@ -3,6 +3,8 @@ set -euo pipefail
 
 source ~/.venv/bin/activate
 
+export HF_HOME="${HF_HOME:-$HOME/.cache/huggingface}"
+
 LIMIT=""
 PURGE=0
 YES=0
@@ -28,10 +30,14 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+banner() {
+    echo "--------------------------------------------------"
+    echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] $1"
+    echo "--------------------------------------------------"
+}
+
 run_stage() {
-    echo "--------------------------------------------------"
-    echo "[$(date -u +'%Y-%m-%dT%H:%M:%SZ')] $*"
-    echo "--------------------------------------------------"
+    banner "$*"
     "$@"
 }
 
@@ -67,5 +73,27 @@ fi
 run_stage python -m core.report
 
 if [[ "$PURGE" -eq 1 ]]; then
-    run_stage python -m core.purge --yes
+    purge_args=()
+    [[ "$YES" -eq 1 ]] && purge_args+=(--yes)
+    run_stage python -m core.purge "${purge_args[@]}"
 fi
+
+banner "pipeline completed, cleaning up run artifacts"
+find . -type d -name "__pycache__" -exec rm -rf {} +
+find . -type f -name "*.pyc" -delete
+
+echo "--------------------------------------------------"
+echo "Pipeline completed successfully."
+echo "Metrics:"
+python -c "
+from core import config
+from core import registry as R
+from core.report import run_report
+conn = R.connect(config.DB_PATH)
+report = run_report(conn)
+print(f'- Total projects: {report[\"total\"]}')
+print(f'- By status:      {report[\"by_status\"]}')
+print(f'- By source:      {report[\"by_source\"]}')
+print(f'- Files by kind:  {report[\"files_by_kind\"]}')
+"
+echo "--------------------------------------------------"

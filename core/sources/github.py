@@ -5,7 +5,7 @@ import hashlib
 import os
 import time
 import zipfile
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
 from core import config
 from core import registry as R
@@ -15,6 +15,7 @@ logger = get_logger(__name__)
 
 GITHUB_API = "https://api.github.com"
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
+GITHUB_REPO_WORKERS = int(os.environ.get("GITHUB_REPO_WORKERS", "6"))
 _PCB_EXTENSIONS = {".kicad_pcb", ".brd", ".pcbdoc"}
 _BINARY_EXTENSIONS = {".schdoc", ".pcbdoc"}
 
@@ -163,18 +164,34 @@ def collect(conn, org, search_term, path_filter=None):
         if not repos:
             break
 
+        # Filter known repos first so we never spend a network call listing
+        # a tree we're going to skip anyway.
+        new_repos = []
         for repo in repos:
             total_seen += 1
             project_id = f"gh_{repo['id']}"
-            name = repo["name"]
-
             if project_id in known_projects:
                 skipped_count += 1
                 continue
+            new_repos.append(repo)
+
+        trees = {}
+        if new_repos:
+            with ThreadPoolExecutor(max_workers=GITHUB_REPO_WORKERS) as executor:
+                futures = {
+                    executor.submit(_list_repo_tree, org, repo["name"], repo["default_branch"]): repo["id"]
+                    for repo in new_repos
+                }
+                for future in as_completed(futures):
+                    trees[futures[future]] = future.result()
+
+        for repo in new_repos:
+            project_id = f"gh_{repo['id']}"
+            name = repo["name"]
 
             repo_url = repo["html_url"]
             branch = repo["default_branch"]
-            tree, truncated = _list_repo_tree(org, name, branch)
+            tree, truncated = trees[repo["id"]]
             if tree is None:
                 continue
 

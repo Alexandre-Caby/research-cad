@@ -1,0 +1,14 @@
+# pycache
+core/__pycache__/
+core/sources/__pycache__/
+core/parsing/__pycache__/
+
+# data folders
+storage/1_raw_data/
+storage/2_register_data/
+storage/3_exploitable_data/
+storage/4_extracted_data/
+storage/5_vector_data/
+
+# logs
+storage/pipeline.log
