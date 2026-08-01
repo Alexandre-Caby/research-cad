@@ -65,7 +65,7 @@ def collect(conn, batch_size=30, limit=None, save_images=True) -> None:
         batch_cache_dir = os.path.join(config.RAW_DIR, f"hf_cache_batch_{idx}")
 
         logger.info("Chargement du batch Parquet %d/%d...", (idx // batch_size) + 1, (len(parquet_files) + batch_size - 1) // batch_size)
-
+        dataset = None
         try:
             dataset = load_dataset(
                 config.HF_DATASET_ID,
@@ -133,7 +133,8 @@ def collect(conn, batch_size=30, limit=None, save_images=True) -> None:
                 new_count += 1
 
         finally:
-            del dataset
+            if dataset is not None:
+                del dataset
             gc.collect()
             _purge_directory(batch_cache_dir)
             logger.info("Cache disque du batch purgé.")

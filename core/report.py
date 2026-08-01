@@ -41,6 +41,6 @@ if __name__ == "__main__":
         if isinstance(value, dict):
             print(key)
             for sub_key, count in value.items():
-                print(f"  {sub_key:<20} {count}")
+                print(f"  {str(sub_key):<20} {count}")
         else:
             print(f"{key:<20} {value}")

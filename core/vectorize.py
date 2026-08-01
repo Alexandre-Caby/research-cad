@@ -31,7 +31,7 @@ def _bom_summary(bom_path, project_name):
     return (
         f"Electronic board from project '{project_name}'. "
         f"This board contains {total_components} placed physical components. "
-        f"Bill of materials summary: {', '.join(component_summaries)}."
+        f"Bill of materials summary: {', '.join(s for s in component_summaries if s)}."
     )
 
 
@@ -112,9 +112,9 @@ def _compose_text(project_name, gathered, conn) -> str:
 
     parts = [f"Project '{project_name}'."]
     if structural_summaries:
-        parts.append("Structural summary: " + " | ".join(structural_summaries))
+        parts.append("Structural summary: " + " | ".join(s for s in structural_summaries if s))
     if bom_summaries:
-        parts.append("BOM summary: " + " | ".join(bom_summaries))
+        parts.append("BOM summary: " + " | ".join(s for s in bom_summaries if s))
 
     components = gathered["components"]
     if components:
@@ -128,7 +128,7 @@ def _compose_text(project_name, gathered, conn) -> str:
                 mouser_specs.append(f"{mpn} ({mfr or 'Unknown'}): {desc} [{cat or 'General'}]")
         
         if mouser_specs:
-            parts.append("Enriched Component Specs: " + " | ".join(mouser_specs[:20]))
+            parts.append("Enriched Component Specs: " + " | ".join(s for s in mouser_specs[:20] if s))
 
     return " ".join(parts)
 

@@ -107,6 +107,10 @@ class ImageEncoder:
             inputs = self._processor(images=images, return_tensors="pt").to(self.device)
             with torch.no_grad():
                 features = self._model.get_image_features(**inputs)
+            if not hasattr(features, "cpu"):
+                features = getattr(features, "pooler_output", None)
+                if features is None:
+                    features = self._model.get_image_features(**inputs).last_hidden_state.mean(dim=1)
             for offset, vec in zip(offsets, self._normalize(features.cpu().numpy())):
                 vectors[start + offset] = vec
         return vectors

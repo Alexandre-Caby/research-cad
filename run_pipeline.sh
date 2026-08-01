@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-source ~/.venv/bin/activate
+if [ -f "$HOME/.venv/bin/activate" ]; then . "$HOME/.venv/bin/activate"; fi
 
 export HF_HOME="${HF_HOME:-$HOME/.cache/huggingface}"
 
