@@ -62,7 +62,7 @@ def _log_api_error(tag: str, res: requests.Response) -> None:
                    body[:300] if body else "<vide>")
     if res.status_code in (403, 429):
         global _quota_exhausted, _rate_limited
-        if "TooManyRequests" in body or "MaxCallPerMinute" in body:
+        if "MaxCallPerMinute" in body:
             _rate_limited = True          # limite PAR MINUTE : temporisable
             logger.warning("%s: limite par minute -> pause et reprise.", tag)
         else:
