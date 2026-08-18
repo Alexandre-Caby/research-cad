@@ -79,7 +79,7 @@ if [[ "$PURGE" -eq 1 ]]; then
 fi
 
 banner "pipeline completed, cleaning up run artifacts"
-find . -type d -name "__pycache__" -exec rm -rf {} +
+find . -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
 find . -type f -name "*.pyc" -delete
 
 echo "--------------------------------------------------"

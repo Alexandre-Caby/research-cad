@@ -41,7 +41,7 @@ def _purge_directory(path):
             logger.warning("Erreur lors de la purge de %s: %s", path, exc)
 
 
-def collect(conn, batch_size=30, limit=None, save_images=True) -> None:
+def collect(conn, batch_size=6, limit=None, save_images=True) -> None:
     from datasets import load_dataset, Image as HFImage
     from huggingface_hub import HfApi
 
