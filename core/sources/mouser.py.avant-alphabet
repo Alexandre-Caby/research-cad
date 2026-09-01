@@ -42,12 +42,6 @@ RATE_PAUSE_S = int(os.environ.get("MOUSER_RATE_PAUSE_S", "65"))
 RATE_PAUSE_MAX = int(os.environ.get("MOUSER_RATE_PAUSE_MAX", "40"))
 _datasheet_seen: set[str] = set()
 
-# Une reference fabricant n'a ni espace ni ponctuation de phrase. Les valeurs de
-# BOM qui en portent sont des descriptions ("LED RED", "R PULL DOWN") : les envoyer
-# consomme du quota pour rien, et une seule suffit a faire echouer tout le lot.
-_ALPHABET_MPN = re.compile(r"^[A-Za-z0-9._/+#-]+$")
-
-
 def _valid_mpn(value: str) -> bool:
     """Filtre AVANT appel : une seule reference invalide fait echouer tout le lot."""
     if not value:
@@ -57,8 +51,6 @@ def _valid_mpn(value: str) -> bool:
     if "|" in value:
         return False
     if not value.isascii():
-        return False
-    if not _ALPHABET_MPN.match(value):
         return False
     return True
 
@@ -270,7 +262,7 @@ def collect_mouser_metadata(conn, limit=None, download_pdfs=None) -> None:
                 logger.warning("Error reading BOM %s: %s", bf["filename"], exc)
 
     if rejected:
-        logger.info("Mouser Source: %d valeur(s) ecartee(s) (hors 4-40 caracteres, pipe, non-ASCII ou hors alphabet MPN).",
+        logger.info("Mouser Source: %d valeur(s) ecartee(s) (hors 4-40 caracteres, pipe ou non-ASCII).",
                     rejected)
 
     if not candidates:

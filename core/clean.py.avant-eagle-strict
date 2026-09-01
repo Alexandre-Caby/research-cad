@@ -28,6 +28,7 @@ SIGNATURES = (
     (b"EESchema Schematic File", "eeschema"),
     (b"(kicad_sch", "kicad"),
     (b"v {xschem", "xschem"),
+    (b"<?xml", "eagle"),
     (b"<eagle", "eagle"),
     (b"<!DOCTYPE eagle", "eagle"),
 )
@@ -37,16 +38,12 @@ def detect_format(abs_path, ext):
     """Rend la cle de parseur, ou None si le contenu n'est pas un schema connu."""
     try:
         with open(abs_path, "rb") as handle:
-            tete = handle.read(2048).lstrip()
+            tete = handle.read(120).lstrip()
     except OSError:
         return None
     for marque, cle in SIGNATURES:
         if tete.startswith(marque):
             return cle
-    # Un XML quelconque n'est pas un schema : le corpus livre du Schematron et
-    # d'autres grammaires sous la meme extension. Eagle, lui, se declare.
-    if tete.startswith(b"<?xml"):
-        return "eagle" if (b"<eagle" in tete or b"DOCTYPE eagle" in tete) else None
     # gEDA s'annonce par "v <AAAAMMJJ> <version>", sans autre marqueur.
     if tete.startswith(b"v ") and tete[2:10].isdigit():
         return "geda"

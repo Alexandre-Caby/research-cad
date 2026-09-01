@@ -37,9 +37,17 @@ def init_db(db_path) -> None:
                     status TEXT,
                     error TEXT,
                     created_at TEXT,
-                    updated_at TEXT
+                    updated_at TEXT,
+                    description TEXT,
+                    components_used TEXT
                 )"""
             )
+            # Migration des bases antérieures : ADD COLUMN échoue si la colonne existe.
+            colonnes = {r[1] for r in conn.execute("PRAGMA table_info(projects)")}
+            for col in ("description", "components_used"):
+                if col not in colonnes:
+                    conn.execute(f"ALTER TABLE projects ADD COLUMN {col} TEXT")
+
             conn.execute(
                 """CREATE TABLE IF NOT EXISTS files (
                     project_id TEXT REFERENCES projects(project_id),
@@ -77,21 +85,26 @@ def content_hash(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
-def upsert_project(conn, project_id, name, source, url, content_hash=None, status=INGESTED) -> None:
+def upsert_project(conn, project_id, name, source, url, content_hash=None, status=INGESTED,
+                   description=None, components_used=None) -> None:
     now = datetime.now(timezone.utc).isoformat()
     with conn:
         conn.execute(
             """INSERT INTO projects
-            (project_id, name, source, url, content_hash, status, error, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?)
+            (project_id, name, source, url, content_hash, status, error, created_at, updated_at,
+             description, components_used)
+            VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?)
             ON CONFLICT(project_id) DO UPDATE SET
                 name=excluded.name,
                 source=excluded.source,
                 url=excluded.url,
                 content_hash=COALESCE(excluded.content_hash, projects.content_hash),
                 status=excluded.status,
-                updated_at=excluded.updated_at""",
-            (project_id, name, source, url, content_hash, status, now, now),
+                updated_at=excluded.updated_at,
+                description=COALESCE(excluded.description, projects.description),
+                components_used=COALESCE(excluded.components_used, projects.components_used)""",
+            (project_id, name, source, url, content_hash, status, now, now,
+             description, components_used),
         )
 
 

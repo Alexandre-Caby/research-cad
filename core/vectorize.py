@@ -47,7 +47,7 @@ def _bom_values(bom_path):
 
 def _gather(project_id, conn) -> dict:
     project = conn.execute(
-        "SELECT name, source FROM projects WHERE project_id=?", (project_id,)
+        "SELECT name, source, description FROM projects WHERE project_id=?", (project_id,)
     ).fetchone()
     files = conn.execute(
         "SELECT filename, kind, ext FROM files WHERE project_id=?", (project_id,)
@@ -64,6 +64,18 @@ def _gather(project_id, conn) -> dict:
         if summary:
             bom_summaries.append(summary)
         components.update(_bom_values(bom_path))
+
+    # Représentations kiutils, lues depuis le tier 3.
+    structure = {"schematic_json": "", "schematic_yaml": ""}
+    for row in files:
+        if row["kind"] in structure and not structure[row["kind"]]:
+            chemin = os.path.join(config.USABLE_DIR, row["filename"])
+            if os.path.exists(chemin):
+                try:
+                    with open(chemin, encoding="utf-8") as f:
+                        structure[row["kind"]] = f.read()
+                except OSError:
+                    pass
 
     schematic_summaries, pcb_summaries = [], []
     schematic_summary, pcb_summary, source_filename = "", "", ""
@@ -101,6 +113,8 @@ def _gather(project_id, conn) -> dict:
         "pcb_summary": pcb_summary,
         "source_filename": source_filename,
         "image_path": image_path,
+        "schematic_json": structure["schematic_json"],
+        "schematic_yaml": structure["schematic_yaml"],
     }
 
 
@@ -111,6 +125,11 @@ def _compose_text(project_name, gathered, conn) -> str:
         return ""
 
     parts = [f"Project '{project_name}'."]
+    # L'intention du projet ouvre le texte, le reste est structurel.
+    projet = gathered.get("project")
+    description = ((projet["description"] if projet is not None else "") or "").strip()
+    if description:
+        parts.append(f"Purpose: {description}")
     if structural_summaries:
         parts.append("Structural summary: " + " | ".join(s for s in structural_summaries if s))
     if bom_summaries:
@@ -152,8 +171,8 @@ def _project_row(project, conn) -> dict | None:
         "text": text,
         "image_path": image_path,
         "components": sorted(gathered["components"]),
-        "yaml": "",
-        "json": "",
+        "yaml": gathered.get("schematic_yaml", ""),
+        "json": gathered.get("schematic_json", ""),
         "board_metrics": json.dumps({
             "schematic": gathered["schematic_summary"],
             "pcb": gathered["pcb_summary"],
